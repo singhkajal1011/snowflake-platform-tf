@@ -1,0 +1,59 @@
+name: Release promotion gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_environment:
+        description: "Source environment to validate, e.g. DEV or TEST"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - TEST
+      target_environment:
+        description: "Target environment to promote into, e.g. TEST or PROD"
+        required: true
+        type: choice
+        options:
+          - TEST
+          - PROD
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  gate:
+    name: Validate promotion gate
+    runs-on: ubuntu-latest
+    environment:
+      name: DEV-Terraform
+
+    env:
+      SNOWFLAKE_ACCOUNT: xygpmhm-gq04150
+      SNOWFLAKE_USER: GITHUB_DEV_TERRAFORM_SVC
+      SNOWFLAKE_ROLE: SYSADMIN
+      SNOWFLAKE_WAREHOUSE: DEV_CUSTOMER_TRANSFORM_WH
+      SOURCE_ENVIRONMENT: ${{ github.event.inputs.source_environment }}
+      TARGET_ENVIRONMENT: ${{ github.event.inputs.target_environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+
+      - name: Validate deployment bundle
+        run: |
+          snow sql --connection github -q \
+            "SELECT * FROM PLATFORM_CONTROL.DEPLOYMENT.CURRENT_ENV_RELEASES WHERE environment = '${SOURCE_ENVIRONMENT}';"
+
+      - name: Validate promotion readiness
+        run: |
+          snow sql --connection github -q \
+            "SELECT CASE WHEN count(*) > 0 THEN 'GATE_PASSED' ELSE 'GATE_FAILED' END AS result FROM PLATFORM_CONTROL.DEPLOYMENT.CURRENT_ENV_RELEASES WHERE environment = '${TARGET_ENVIRONMENT}';"
