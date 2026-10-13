@@ -1,0 +1,49 @@
+name: Publish release metadata
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version to record, e.g. v1.3.0"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-metadata:
+    name: Publish infra release metadata
+    runs-on: ubuntu-latest
+    environment:
+      name: DEV-Terraform
+
+    env:
+      SNOWFLAKE_ACCOUNT: xygpmhm-gq04150
+      SNOWFLAKE_USER: GITHUB_DEV_TERRAFORM_SVC
+      SNOWFLAKE_ROLE: SYSADMIN
+      SNOWFLAKE_WAREHOUSE: DEV_CUSTOMER_TRANSFORM_WH
+      REPO_NAME: snowflake-platform-tf
+      ENVIRONMENT: DEV
+      DATABASE_NAME: DEV_CUSTOMER_DB
+      REPO_URL: https://github.com/singhkajal1011/snowflake-platform-tf
+      RELEASE_VERSION: ${{ github.event.inputs.release_version || github.ref_name || format('main-{0}', github.sha) }}
+      GIT_SHA: ${{ github.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Snowflake CLI (OIDC)
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+
+      - name: Publish release metadata
+        run: bash scripts/publish_release_metadata.sh
