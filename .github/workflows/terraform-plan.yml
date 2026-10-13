@@ -60,7 +60,7 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::525218385225:role/snowflake-platform-tf-github-oidc
+          role-to-assume: arn:aws:iam::525218385225:role/snowflake-platform-tf-github-oidc-singhkajal1011
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Setup Terraform
