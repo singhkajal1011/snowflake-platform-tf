@@ -11,15 +11,9 @@ name: Terraform Plan
 # This is why the path filter below includes dcm/** as well as terraform/** -- a DCM-only
 # PR must also run Terraform Plan first, so dcm-plan.yml has something to chain from.
 #
-# Deliberately DEV-only for this demo. There is no "choose an environment" dropdown here
-# because selecting anything other than DEV would not actually work today: only the
-# DEV-Terraform GitHub Environment and GITHUB_DEV_TERRAFORM_SVC OIDC identity exist
-# (terraform/oidc_service_user.tf). `terraform/env/test/` and `terraform/env/prod/` are
-# scaffolded Terraform tfvars/backend configs for a future rollout, but are not wired into
-# any pipeline yet — adding TEST/UAT/PROD means repeating this exact pattern per
-# environment: a new GitHub Environment pair, a new OIDC identity pair in
-# terraform/oidc_service_user.tf, and a new `env` value in each domain's manifest.yml
-# templating config, matching the identity-isolation model documented in README.md.
+# Pull-request plans are configured to use DEV and do not accept an environment input.
+# Manual plans can select DEV or TEST, both of which have matching Terraform
+# state/configuration and Snowflake OIDC identities. PROD is not wired yet.
 
 on:
   pull_request:
@@ -29,6 +23,15 @@ on:
       - "dcm/**"
       - ".github/workflows/terraform-plan.yml"
   workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Environment to plan (PR plans always use DEV)
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - test
 
 permissions:
   contents: read
@@ -37,15 +40,15 @@ permissions:
 
 jobs:
   plan:
-    name: Terraform Plan
+    name: Terraform Plan (${{ github.event_name == 'pull_request' && 'dev' || inputs.target_environment }})
     runs-on: ubuntu-latest
     environment:
-      name: DEV-Terraform
+      name: ${{ github.event_name == 'pull_request' && 'DEV-Terraform' || (inputs.target_environment == 'test' && 'TEST-Terraform' || 'DEV-Terraform') }}
 
     env:
       TF_VAR_snowflake_organization_name: xygpmhm
       TF_VAR_snowflake_account_name: gq04150
-      TARGET_ENV: dev
+      TARGET_ENV: ${{ github.event_name == 'pull_request' && 'dev' || inputs.target_environment }}
 
     defaults:
       run:

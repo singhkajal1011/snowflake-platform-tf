@@ -349,7 +349,7 @@ service user's `WORKLOAD_IDENTITY` auth, with the OIDC token fetched fresh insid
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**` | `terraform fmt -check` + `validate` + `plan` (posted as PR comment) |
+| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV; manual runs can select DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
 | `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**` | `Terraform Apply` |
 | `.github/workflows/dcm-plan.yml` | `workflow_run` — fires once Terraform Plan finishes | `DCM Plan` (one sequential job, all changed domains) |
 | `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes | `DCM Deploy` (one sequential job, all changed domains) |
@@ -362,6 +362,11 @@ PR/push event directly. DCM's identity (`GITHUB_DEV_DCM_SVC`) is created by Terr
 so DCM must never run without a guaranteed-successful Terraform run immediately
 before it — this is why both Terraform workflows' path filters include `dcm/**` too: a
 DCM-only change still needs Terraform to run first, so DCM has something to chain from.
+
+Terraform plans triggered by a pull request always use the DEV account identity and
+state. A manually dispatched Terraform Plan can target DEV or TEST; TEST runs use the
+protected `TEST-Terraform` GitHub Environment. PROD is intentionally not offered until
+its Terraform state, Snowflake OIDC identity, and protection environment are configured.
 
 ```
 Pull Request touching terraform/** or dcm/**
