@@ -349,7 +349,7 @@ service user's `WORKLOAD_IDENTITY` auth, with the OIDC token fetched fresh insid
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV; manual runs can select DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
+| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV and require a Conventional Commit title; only repository admins/maintainers can manually run plans, selecting DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
 | `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**` | `Terraform Apply` |
 | `.github/workflows/dcm-plan.yml` | `workflow_run` — fires once Terraform Plan finishes | `DCM Plan` (one sequential job, all changed domains) |
 | `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes | `DCM Deploy` (one sequential job, all changed domains) |
@@ -367,6 +367,9 @@ Terraform plans triggered by a pull request always use the DEV account identity 
 state. A manually dispatched Terraform Plan can target DEV or TEST; TEST runs use the
 protected `TEST-Terraform` GitHub Environment. PROD is intentionally not offered until
 its Terraform state, Snowflake OIDC identity, and protection environment are configured.
+The plan job waits for request validation: PR titles must follow Conventional Commits,
+and manual dispatchers must have repository `admin` or `maintain` permission (including
+access granted through a team).
 
 ```
 Pull Request touching terraform/** or dcm/**

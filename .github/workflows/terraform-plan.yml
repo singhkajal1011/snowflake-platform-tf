@@ -39,9 +39,44 @@ permissions:
   id-token: write
 
 jobs:
+  validate-plan-request:
+    name: Validate Plan Request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate PR title follows Conventional Commits
+        if: github.event_name == 'pull_request'
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check repository permission for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        with:
+          script: |
+            const user = process.env.TRIGGERING_ACTOR;
+            const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: user
+            });
+            if (!['admin', 'maintain'].includes(permission.permission)) {
+              core.setFailed(`User ${user} does not have admin/maintain permission.`);
+            }
+
   plan:
     name: Terraform Plan (${{ github.event_name == 'pull_request' && 'dev' || inputs.target_environment }})
+    needs: validate-plan-request
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
     environment:
       name: ${{ github.event_name == 'pull_request' && 'DEV-Terraform' || (inputs.target_environment == 'test' && 'TEST-Terraform' || 'DEV-Terraform') }}
 
