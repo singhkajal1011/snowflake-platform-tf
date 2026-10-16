@@ -101,7 +101,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            if (context.ref !== 'refs/heads/main') {
+            if (context.ref !== 'refs/heads/feat/terraform-plan-request-validation') {
               core.setFailed('Dispatch Terraform Plan from the main branch only.');
             }
 
