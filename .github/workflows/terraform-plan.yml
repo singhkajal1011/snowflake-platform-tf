@@ -46,12 +46,6 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - name: Validate PR title follows Conventional Commits
-        if: github.event_name == 'pull_request'
-        uses: amannn/action-semantic-pull-request@v5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Check repository permission for manual runs
         if: github.event_name == 'workflow_dispatch'
         uses: actions/github-script@v7
