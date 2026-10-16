@@ -349,7 +349,8 @@ service user's `WORKLOAD_IDENTITY` auth, with the OIDC token fetched fresh insid
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV and require a Conventional Commit title; only repository admins/maintainers can manually run plans, selecting DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
+| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV and require an authorized author; only repository admins/maintainers can manually run plans, selecting DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
+| `.github/workflows/terraform-plan-author-validation.yml` | `pull_request_target` touching `terraform/**` or `dcm/**` | Uses a protected GitHub App credential to verify the PR author has repository `admin` or `maintain` role; reports `Terraform Plan Author Authorization` on the PR head commit |
 | `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**` | `Terraform Apply` |
 | `.github/workflows/dcm-plan.yml` | `workflow_run` — fires once Terraform Plan finishes | `DCM Plan` (one sequential job, all changed domains) |
 | `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes | `DCM Deploy` (one sequential job, all changed domains) |
@@ -367,9 +368,24 @@ Terraform plans triggered by a pull request always use the DEV account identity 
 state. A manually dispatched Terraform Plan can target DEV or TEST; TEST runs use the
 protected `TEST-Terraform` GitHub Environment. PROD is intentionally not offered until
 its Terraform state, Snowflake OIDC identity, and protection environment are configured.
-The plan job waits for request validation: PR titles must follow Conventional Commits,
-and manual dispatchers must have repository `admin` or `maintain` permission (including
-access granted through a team).
+The plan job waits for request validation: PR authors must have repository `admin` or
+`maintain` role, and PR titles must follow Conventional Commits (enforced by
+`pr-title-lint.yml`). Manual dispatchers must have repository `admin` or `maintain` role.
+The permission API evaluates the highest role granted through direct, team, organization,
+or enterprise access.
+
+To enable exact role checks, create a GitHub App installed only on this repository with
+**Administration: read** and **Checks: write** repository permissions. Add its numeric
+ID as the `PLAN_AUTH_APP_ID` repository variable. Create the `PLAN-AUTHORIZATION`
+environment, add the App private key as the `PLAN_AUTH_APP_PRIVATE_KEY` environment
+secret, restrict deployments to `main`, and configure required reviewers. The review
+approval is required before the App credential can be used for either the PR author
+check or a manual plan request. Require the `Terraform Plan Author Authorization` check
+from this App in the `main` branch ruleset. If a PR plan times out while waiting for the
+authorization approval, rerun Terraform Plan after the authorization check completes.
+For initial rollout, merge `.github/workflows/terraform-plan-author-validation.yml` to
+`main` and configure the App/environment before enabling the Terraform Plan dependency
+on its check; `pull_request_target` uses the workflow definition from the base branch.
 
 ```
 Pull Request touching terraform/** or dcm/**
