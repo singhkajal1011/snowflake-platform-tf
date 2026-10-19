@@ -1,21 +1,19 @@
-name: Terraform Plan Author Validation
+name: PR Roster Authorization
 
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, edited, reopened, synchronize]
-    paths:
-      - "terraform/**"
-      - "dcm/**"
-      - ".github/workflows/terraform-plan.yml"
-      - ".github/workflows/terraform-plan-author-validation.yml"
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    branches: [main]
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
 
 jobs:
   authorize:
-    name: Terraform Plan Author Authorization
+    name: PR Roster Authorization
     runs-on: ubuntu-latest
     environment: PLAN-AUTHORIZATION
     permissions:
@@ -29,64 +27,206 @@ jobs:
           private-key: ${{ secrets.PLAN_AUTH_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-administration: read
+          permission-contents: read
           permission-checks: write
+          permission-members: read
+          permission-pull-requests: read
 
-      - name: Check PR author repository role
+      - name: Validate contributor and approver roster
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const pullRequest = context.payload.pull_request;
-            const author = pullRequest.user.login;
-            const checkName = 'Terraform Plan Author Authorization';
-            const { data: check } = await github.rest.checks.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: checkName,
-              head_sha: pullRequest.head.sha,
-              status: 'in_progress',
-              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              output: {
-                title: 'Checking pull request author role',
-                summary: `Checking whether @${author} has repository admin or maintain permission.`
-              }
-            });
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = pullRequest.head.sha;
+            const contributorCheckName = 'PR Contributor Authorization';
+            const approverCheckName = 'PR Approver Authorization';
+            const terraformPlanCheckName = 'Terraform Plan Author Authorization';
+            const detailsUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            async function createCheck(name, summary) {
+              const { data } = await github.rest.checks.create({
+                owner,
+                repo,
+                name,
+                head_sha: headSha,
+                status: 'in_progress',
+                details_url: detailsUrl,
+                output: { title: 'Checking PR roster authorization', summary }
+              });
+              return data.id;
+            }
+
+            async function finishCheck(id, success, title, summary) {
+              await github.rest.checks.update({
+                owner,
+                repo,
+                check_run_id: id,
+                status: 'completed',
+                conclusion: success ? 'success' : 'failure',
+                output: { title, summary }
+              });
+            }
+
+            const contributorCheckId = await createCheck(
+              contributorCheckName,
+              'Checking the pull request author against .github/pr-access-control.yml.'
+            );
+            const approverCheckId = await createCheck(
+              approverCheckName,
+              'Checking for an approval from a listed individual on the current PR commit.'
+            );
+            const terraformPlanCheckId = await createCheck(
+              terraformPlanCheckName,
+              'Checking whether the PR author is listed as an approved contributor.'
+            );
 
             try {
-              const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                username: author
+              const { data: rosterFile } = await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: '.github/pr-access-control.yml',
+                ref: pullRequest.base.sha
               });
-              if (!['admin', 'maintain'].includes(access.role_name)) {
+              if (Array.isArray(rosterFile) || rosterFile.type !== 'file') {
+                throw new Error('.github/pr-access-control.yml must be a file.');
+              }
+
+              // The roster is JSON-compatible YAML so it can be parsed without external dependencies.
+              const roster = JSON.parse(
+                Buffer.from(rosterFile.content, 'base64').toString('utf8')
+              );
+              if (
+                roster.schema_version !== 1 ||
+                roster.repository?.toLowerCase() !== `${owner}/${repo}`.toLowerCase() ||
+                !Array.isArray(roster.approvers?.users) ||
+                !Array.isArray(roster.contributors?.users) ||
+                !Array.isArray(roster.contributors?.teams) ||
+                !Number.isInteger(roster.policy?.required_approvals) ||
+                roster.policy.required_approvals < 1 ||
+                !roster.approvers.users.every(user => typeof user === 'string' && user.length > 0) ||
+                !roster.contributors.users.every(user => typeof user === 'string' && user.length > 0) ||
+                !roster.contributors.teams.every(team => typeof team === 'string' && team.length > 0)
+              ) {
                 throw new Error(
-                  `PR author @${author} has repository role "${access.role_name}" and must have admin or maintain permission.`
+                  '.github/pr-access-control.yml has an invalid schema or repository name.'
                 );
               }
 
-              await github.rest.checks.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                check_run_id: check.id,
-                status: 'completed',
-                conclusion: 'success',
-                output: {
-                  title: 'PR author is authorized',
-                  summary: `@${author} has repository role "${access.role_name}".`
+              const author = pullRequest.user.login;
+              const normalizedAuthor = author.toLowerCase();
+              let contributorAuthorized = roster.contributors.users.some(
+                user => user.toLowerCase() === normalizedAuthor
+              );
+
+              const configuredTeams = [];
+              for (const teamReference of roster.contributors.teams) {
+                const [teamOwner, teamSlug, ...extraParts] = teamReference.split('/');
+                if (
+                  !teamOwner ||
+                  !teamSlug ||
+                  extraParts.length > 0 ||
+                  teamOwner.toLowerCase() !== owner.toLowerCase()
+                ) {
+                  throw new Error(
+                    `Contributor team "${teamReference}" must use the ${owner}/team-slug format.`
+                  );
                 }
+
+                await github.rest.teams.getByName({ org: owner, team_slug: teamSlug });
+                configuredTeams.push(teamSlug);
+              }
+
+              for (const teamSlug of configuredTeams) {
+                if (contributorAuthorized) break;
+                try {
+                  const { data: membership } = await github.rest.teams.getMembershipForUserInOrg({
+                    org: owner,
+                    team_slug: teamSlug,
+                    username: author
+                  });
+                  contributorAuthorized = membership.state === 'active';
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+
+              const contributorSummary = contributorAuthorized
+                ? `@${author} is listed as an approved contributor.`
+                : `@${author} is not listed as an approved contributor. Add the GitHub username or an organization team they belong to in .github/pr-access-control.yml to allow this PR to merge.`;
+              await finishCheck(
+                contributorCheckId,
+                contributorAuthorized,
+                contributorAuthorized ? 'Contributor is authorized' : 'Contributor is not authorized',
+                contributorSummary
+              );
+              await finishCheck(
+                terraformPlanCheckId,
+                contributorAuthorized,
+                contributorAuthorized ? 'PR author is authorized' : 'PR author is not authorized',
+                contributorSummary
+              );
+
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner,
+                repo,
+                pull_number: pullRequest.number,
+                per_page: 100
               });
+              const latestReviews = new Map();
+              for (const review of reviews) {
+                if (review.user?.login) {
+                  latestReviews.set(review.user.login.toLowerCase(), review);
+                }
+              }
+
+              const listedApprovers = new Set(
+                roster.approvers.users.map(user => user.toLowerCase())
+              );
+              const authorizedApprovalCount = [...latestReviews.entries()].filter(
+                ([login, review]) =>
+                  login !== normalizedAuthor &&
+                  listedApprovers.has(login) &&
+                  review.state === 'APPROVED' &&
+                  review.commit_id === headSha
+              ).length;
+              const requiredApprovals = roster.policy.required_approvals;
+              const authorizedApproval = authorizedApprovalCount >= requiredApprovals;
+              const approverSummary =
+                `Found ${authorizedApprovalCount} of ${requiredApprovals} required approvals ` +
+                'from listed individual approvers on the current PR commit.';
+              await finishCheck(
+                approverCheckId,
+                authorizedApproval,
+                authorizedApproval ? 'Listed approver approval found' : 'Listed approver approval required',
+                approverSummary
+              );
+
+              if (!contributorAuthorized || !authorizedApproval) {
+                core.setFailed(
+                  'The PR does not satisfy the contributor and/or listed-approver roster policy.'
+                );
+              }
             } catch (error) {
-              await github.rest.checks.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                check_run_id: check.id,
-                status: 'completed',
-                conclusion: 'failure',
-                output: {
-                  title: 'PR author is not authorized',
-                  summary: error.message
-                }
-              });
+              await finishCheck(
+                contributorCheckId,
+                false,
+                'Contributor authorization could not be verified',
+                error.message
+              );
+              await finishCheck(
+                approverCheckId,
+                false,
+                'Approver authorization could not be verified',
+                error.message
+              );
+              await finishCheck(
+                terraformPlanCheckId,
+                false,
+                'PR author authorization could not be verified',
+                error.message
+              );
               core.setFailed(error.message);
             }

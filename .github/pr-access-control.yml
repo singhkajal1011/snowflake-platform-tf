@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "repository": "singhkajal1011/snowflake-platform-tf",
+  "approvers": {
+    "users": []
+  },
+  "contributors": {
+    "users": [],
+    "teams": []
+  },
+  "policy": {
+    "required_approvals": 1
+  }
+}

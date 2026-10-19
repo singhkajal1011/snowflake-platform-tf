@@ -350,7 +350,7 @@ service user's `WORKLOAD_IDENTITY` auth, with the OIDC token fetched fresh insid
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV and require an authorized author; only repository admins/maintainers can manually run plans, selecting DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
-| `.github/workflows/terraform-plan-author-validation.yml` | `pull_request_target` touching `terraform/**` or `dcm/**` | Uses a protected GitHub App credential to verify the PR author has repository `admin` or `maintain` role; reports `Terraform Plan Author Authorization` on the PR head commit |
+| `.github/workflows/terraform-plan-author-validation.yml` | `pull_request_target` and `pull_request_review` for PRs targeting `main` | Validates contributors against `.github/pr-access-control.yml`, requires a current-commit approval from a listed individual approver, and reports `Terraform Plan Author Authorization` for Terraform Plan |
 | `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**` | `Terraform Apply` |
 | `.github/workflows/dcm-plan.yml` | `workflow_run` — fires once Terraform Plan finishes | `DCM Plan` (one sequential job, all changed domains) |
 | `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes | `DCM Deploy` (one sequential job, all changed domains) |
@@ -368,21 +368,34 @@ Terraform plans triggered by a pull request always use the DEV account identity 
 state. A manually dispatched Terraform Plan can target DEV or TEST; TEST runs use the
 protected `TEST-Terraform` GitHub Environment. PROD is intentionally not offered until
 its Terraform state, Snowflake OIDC identity, and protection environment are configured.
-The plan job waits for request validation: PR authors must have repository `admin` or
-`maintain` role, and PR titles must follow Conventional Commits (enforced by
-`pr-title-lint.yml`). Manual dispatchers must have repository `admin` or `maintain` role.
-The permission API evaluates the highest role granted through direct, team, organization,
-or enterprise access.
+The plan job waits for contributor authorization from `.github/pr-access-control.yml`;
+PR titles must also follow Conventional Commits (enforced by `pr-title-lint.yml`). Manual
+dispatchers must have repository `admin` or `maintain` role. The roster workflow reports
+`PR Contributor Authorization` and `PR Approver Authorization` as separate checks. Require
+both checks in the `main` branch ruleset so only listed contributors can merge and at least
+the configured number of listed individual approvers have approved the current PR commit.
+Set `policy.required_approvals` and the ruleset's required approval count to the same value.
 
-To enable exact role checks, create a GitHub App installed only on this repository with
-**Administration: read** and **Checks: write** repository permissions. Add its numeric
-ID as the `PLAN_AUTH_APP_ID` repository variable. Create the `PLAN-AUTHORIZATION`
+The roster file is JSON-compatible YAML. Add GitHub usernames under `approvers.users` and
+`contributors.users`; add organization teams under `contributors.teams` using
+`organization/team-slug`. Set `policy.required_approvals` to the number of approvals
+required from listed individual approvers. Listed contributors can still need repository
+write access to push branches; the roster controls PR eligibility but does not grant GitHub permissions.
+For contributions from outside collaborators, forks can be used. Team entries require an
+organization-owned repository and the GitHub App's organization Members: read permission.
+
+To enable roster checks and manual-plan role checks, create a GitHub App installed only on this repository with
+**Administration: read**, **Contents: read**, **Checks: write**, and **Pull requests: read**
+repository permissions. For contributor team entries, also grant **Members: read** at the
+organization level. Add its numeric ID as the `PLAN_AUTH_APP_ID` repository variable.
+Create the `PLAN-AUTHORIZATION`
 environment, add the App private key as the `PLAN_AUTH_APP_PRIVATE_KEY` environment
-secret, restrict deployments to `main`, and configure required reviewers. The review
-approval is required before the App credential can be used for either the PR author
+secret, restrict deployments to `main`, and configure required reviewers. The environment
+approval is required before the App credential can be used for either the contributor
 check or a manual plan request. Require the `Terraform Plan Author Authorization` check
-from this App in the `main` branch ruleset. If a PR plan times out while waiting for the
-authorization approval, rerun Terraform Plan after the authorization check completes.
+from this App for Terraform plan paths in the `main` branch ruleset. If a PR plan times
+out while waiting for the authorization approval, rerun Terraform Plan after the check
+completes.
 For initial rollout, merge `.github/workflows/terraform-plan-author-validation.yml` to
 `main` and configure the App/environment before enabling the Terraform Plan dependency
 on its check; `pull_request_target` uses the workflow definition from the base branch.
