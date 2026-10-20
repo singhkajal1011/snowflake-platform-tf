@@ -199,7 +199,8 @@ Nothing Terraform-related lives outside `terraform/`; nothing DCM-related lives 
 **Quick way to tell the 3 Terraform roots apart**: `terraform/bootstrap/state-backend/` and
 `terraform/bootstrap/oidc-identity/` are each applied **once, by hand**, with local state,
 and never run by CI. Everything else in `terraform/` is the **ongoing** root module —
-remote (S3) state, deployed automatically by CI on every merge to `main`.
+remote (S3) state, planned automatically by CI on every merge to `main` and applied after
+the Terraform and DCM reviewer gates are approved.
 
 ---
 
@@ -349,10 +350,11 @@ service user's `WORKLOAD_IDENTITY` auth, with the OIDC token fetched fresh insid
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV; manual runs can select DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
-| `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**` | `Terraform Apply` |
+| `.github/workflows/terraform-plan.yml` | Pull Request touching `terraform/**` **or** `dcm/**`, or manual dispatch | PR plans always use DEV and require an authorized author; only repository admins/maintainers can manually run plans, selecting DEV or TEST. Runs `terraform fmt -check` + `validate` + `plan` (PR plan posted as a comment) |
+| `.github/workflows/terraform-plan-author-validation.yml` | `pull_request_target` and `pull_request_review` for PRs targeting `main` | Validates contributors against `.github/pr-access-control.yml`, requires a current-commit approval from a listed individual approver, and reports `Terraform Plan Author Authorization` for Terraform Plan |
+| `.github/workflows/terraform-apply.yml` | Push to `main` touching `terraform/**` **or** `dcm/**`, or manual dispatch | Plans Terraform, shows resource actions in the run summary, waits for approval, then applies that exact saved plan |
 | `.github/workflows/dcm-plan.yml` | `workflow_run` — fires once Terraform Plan finishes | `DCM Plan` (one sequential job, all changed domains) |
-| `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes | `DCM Deploy` (one sequential job, all changed domains) |
+| `.github/workflows/dcm-deploy.yml` | `workflow_run` — fires once Terraform Apply finishes, or manual dispatch | Plans changed active domains, shows DCM object actions in the run summary, waits for approval, then deploys those same domains |
 
 **Terraform always runs first, DCM always runs second, one after another — by design,
 per explicit requirement.** The two tools still live in separate files (CI load,
@@ -367,6 +369,58 @@ Terraform plans triggered by a pull request always use the DEV account identity 
 state. A manually dispatched Terraform Plan can target DEV or TEST; TEST runs use the
 protected `TEST-Terraform` GitHub Environment. PROD is intentionally not offered until
 its Terraform state, Snowflake OIDC identity, and protection environment are configured.
+The plan job waits for contributor authorization from `.github/pr-access-control.yml`;
+PR titles must also follow Conventional Commits (enforced by `pr-title-lint.yml`). Manual
+dispatchers must have repository `admin` or `maintain` role. The roster workflow reports
+`PR Contributor Authorization` and `PR Approver Authorization` as separate checks. Require
+both checks in the `main` branch ruleset so only listed contributors can merge and at least
+the configured number of listed individual approvers have approved the current PR commit.
+Set `policy.required_approvals` and the ruleset's required approval count to the same value.
+
+The roster file is JSON-compatible YAML. Add GitHub usernames under `approvers.users` and
+`contributors.users`; add organization teams under `contributors.teams` using
+`organization/team-slug`. Set `policy.required_approvals` to the number of approvals
+required from listed individual approvers. Listed contributors can still need repository
+write access to push branches; the roster controls PR eligibility but does not grant GitHub permissions.
+For contributions from outside collaborators, forks can be used. Team entries require an
+organization-owned repository and the GitHub App's organization Members: read permission.
+
+To enable roster checks and manual-plan role checks, create a GitHub App installed only on this repository with
+**Administration: read**, **Contents: read**, **Checks: write**, and **Pull requests: read**
+repository permissions. For contributor team entries, also grant **Members: read** at the
+organization level. Add its numeric ID as the `PLAN_AUTH_APP_ID` repository variable.
+Create the `PLAN-AUTHORIZATION`
+environment, add the App private key as the `PLAN_AUTH_APP_PRIVATE_KEY` environment
+secret, restrict deployments to `main`, and configure required reviewers. The environment
+approval is required before the App credential can be used for either the contributor
+check or a manual plan request. Require the `Terraform Plan Author Authorization` check
+from this App for Terraform plan paths in the `main` branch ruleset. If a PR plan times
+out while waiting for the authorization approval, rerun Terraform Plan after the check
+completes.
+For initial rollout, merge `.github/workflows/terraform-plan-author-validation.yml` to
+`main` and configure the App/environment before enabling the Terraform Plan dependency
+on its check; `pull_request_target` uses the workflow definition from the base branch.
+
+### DEV apply approvals
+
+The DEV apply workflows show the full Terraform resource plan or combined DCM domain
+plans in the run summary before requesting approval. Terraform applies the exact saved
+plan that was reviewed; its short-lived Actions artifact can contain sensitive values,
+so keep workflow/artifact access limited to trusted repository users. DCM plans and
+deploys the same active domains from the same commit.
+Apply/deploy runs are serialized, and each workflow checks that its reviewed commit is
+still the tip of `main` after approval; if `main` advanced while approval was pending,
+that stale run fails safely and the latest run must be reviewed.
+
+Create two additional GitHub Environments: `DEV-Terraform-Apply` and `DEV-DCM-Apply`.
+Configure each with required reviewers and restrict deployments to `main`. These
+environments are deliberate approval gates; keep `DEV-Terraform` and `DEV-DCM` available
+to the plan/deploy jobs because those are the Snowflake OIDC subject environments. A
+Terraform reviewer opens the `Terraform Plan` run summary and approves the
+`Approve Terraform Apply` deployment; after Terraform succeeds, a DCM reviewer inspects
+the `DCM Plan` summary and approves `Approve DCM Deploy`. Rejecting either gate prevents
+the corresponding apply/deploy. Set the environments' required reviewers in GitHub
+Settings; workflow YAML cannot configure environment protection rules.
 
 ```
 Pull Request touching terraform/** or dcm/**
@@ -391,13 +445,16 @@ Pull Request touching terraform/** or dcm/**
 
 Push to main touching terraform/** or dcm/**
   └─► terraform-apply.yml  (push)
-        └── apply job: terraform apply -auto-approve
+        ├── terraform-plan job: terraform plan → run summary + short-lived plan artifact
+        ├── approve-terraform-apply job: required reviewer gate
+        └── apply job: applies the exact reviewed plan
               │
               ▼  (workflow_run, on completion, gated on success)
         dcm-deploy.yml
-              └── dcm-deploy job: resolves the commit → detects changed domains →
-                  loops through them sequentially (synthesize → snow dcm create →
-                  snow dcm deploy)
+              ├── dcm-plan job: detects changed active domains → synthesizes →
+              │   snow dcm create → snow dcm plan → run summary
+              ├── approve-dcm-deploy job: required reviewer gate
+              └── dcm-deploy job: deploys the planned domains from the same commit
 ```
 
 A domain only ever gets planned/deployed if (a) its own `dcm/domains/<domain>/` files
@@ -408,9 +465,10 @@ domain too. Each active domain is still planned/deployed independently inside on
 sequential loop (not a parallel matrix — see below for why), so one domain's failure
 doesn't stop the others from being attempted or reported.
 
-Each workflow runs under its own GitHub Environment (`DEV-Terraform` or `DEV-DCM`) —
-visible under **Settings → Environments** in the GitHub UI, each scoped to its own OIDC
-service-user subject claim.
+Terraform and DCM plan/deploy jobs run under their own GitHub Environment
+(`DEV-Terraform` or `DEV-DCM`) — visible under **Settings → Environments** in the GitHub
+UI, each scoped to its own OIDC service-user subject claim. Separate `*-Apply` environments
+provide the post-plan reviewer gates and are not used for Snowflake OIDC authentication.
 
 ### Why DCM is sequenced via `workflow_run`, and why there's no per-domain matrix anymore
 
@@ -469,22 +527,22 @@ requirement that the two tools run one after another.)
 
 ## Environments & Versioning
 
-How "what version is running where" is actually answered, end to end — DEV deploys
-continuously on every merge; TEST (and, in future, PROD) is promoted deliberately, by
-version, with a human approval gate.
+How "what version is running where" is actually answered, end to end — DEV plans
+automatically on every merge and deploys after sequential Terraform and DCM approvals;
+TEST (and, in future, PROD) is promoted deliberately, by version, with a human approval gate.
 
 ### Environment Details
 
 | Environment | How it's reached | Snowflake objects (Customer domain) | GitHub Environment | Approval gate |
 |---|---|---|---|---|
-| DEV | Automatic — every merge to `main` | `DEV_CUSTOMER_DB`, `DEV_CUSTOMER_*_WH`, `DEV_CUSTOMER_*_PRSN` | `DEV-Terraform` / `DEV-DCM` | None (continuous) |
+| DEV | Automatic plan; apply after approvals on every merge to `main` | `DEV_CUSTOMER_DB`, `DEV_CUSTOMER_*_WH`, `DEV_CUSTOMER_*_PRSN` | `DEV-Terraform` / `DEV-DCM` | Required reviewer after each plan (`DEV-Terraform-Apply`, then `DEV-DCM-Apply`) |
 | TEST | Manual — `promote.yml` dispatched against a specific release tag (Terraform, then DCM) | `TEST_CUSTOMER_DB`, `TEST_CUSTOMER_*_WH`, `TEST_CUSTOMER_*_PRSN` | `TEST-Terraform` / `TEST-DCM` | Required reviewer, non-bypassable even by an admin |
 | PROD | Not built yet | — | — | — |
 
 Unlike a branch-per-environment model (one long-lived branch per environment, promotion =
 merging one branch into the next), this repo uses **trunk-based development with
 version-tag promotion**: a single `main` branch, squash-merged, deploying continuously to
-DEV; TEST (and future PROD) are promoted by picking a specific, already-tagged release —
+DEV after human approval of the plans; TEST (and future PROD) are promoted by picking a specific, already-tagged release —
 never "whatever is currently on `main`." This was a deliberate choice, not an oversight:
 it gives an exact, auditable answer to "what's in TEST right now" (a specific tag,
 promoted on a specific date, by a specific approver) that a branch-per-environment model
@@ -497,7 +555,8 @@ the `test` branch," with no separate version identifier).
 feature branch -> PR (Conventional Commits title, required checks) -> squash-merge to main
                                                                               │
                                                                               ▼
-                                                              DEV deploys automatically
+                                                DEV plans automatically; approvals gate
+                                                Terraform apply, then DCM deploy
                                                                               │
                                                                               ▼
                                                     release-please updates one standing

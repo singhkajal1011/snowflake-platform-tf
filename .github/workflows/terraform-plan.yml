@@ -39,9 +39,113 @@ permissions:
   id-token: write
 
 jobs:
+  validate-pr-author:
+    name: Validate PR Author
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Wait for trusted PR author authorization
+        uses: actions/github-script@v7
+        env:
+          PLAN_AUTH_APP_ID: ${{ vars.PLAN_AUTH_APP_ID }}
+        with:
+          script: |
+            const appId = Number(process.env.PLAN_AUTH_APP_ID);
+            if (!appId) {
+              core.setFailed('Repository variable PLAN_AUTH_APP_ID is not configured.');
+              return;
+            }
+
+            const headSha = context.payload.pull_request.head.sha;
+            const checkName = 'Terraform Plan Author Authorization';
+            const maxAttempts = 60;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              const { data } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: headSha,
+                per_page: 100
+              });
+              const authorization = data.check_runs
+                .filter(check => check.name === checkName && check.app?.id === appId)
+                .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at))[0];
+
+              if (authorization?.status === 'completed') {
+                if (authorization.conclusion !== 'success') {
+                  core.setFailed(`PR author authorization failed: ${authorization.output?.summary || authorization.conclusion}`);
+                }
+                return;
+              }
+
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+
+            core.setFailed(
+              'Timed out waiting for Terraform Plan Author Authorization. ' +
+              'Wait for the authorization check to finish, then rerun this workflow.'
+            );
+
+  validate-manual-actor:
+    name: Validate Manual Dispatcher
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: PLAN-AUTHORIZATION
+    permissions:
+      contents: read
+    steps:
+      - name: Require dispatch from the default branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.ref !== 'refs/heads/feat/terraform-plan-request-validation') {
+              core.setFailed('Dispatch Terraform Plan from the main branch only.');
+            }
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PLAN_AUTH_APP_ID }}
+          private-key: ${{ secrets.PLAN_AUTH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
+      - name: Check dispatcher repository role
+        uses: actions/github-script@v7
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const user = process.env.TRIGGERING_ACTOR;
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: user
+            });
+            if (!['admin', 'maintain'].includes(access.role_name)) {
+              core.setFailed(
+                `User ${user} has repository role "${access.role_name}" and must have admin or maintain permission.`
+              );
+            }
+
   plan:
     name: Terraform Plan (${{ github.event_name == 'pull_request' && 'dev' || inputs.target_environment }})
+    needs: [validate-pr-author, validate-manual-actor]
+    if: >-
+      always() &&
+      (needs.validate-pr-author.result == 'success' || needs.validate-pr-author.result == 'skipped') &&
+      (needs.validate-manual-actor.result == 'success' || needs.validate-manual-actor.result == 'skipped')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
     environment:
       name: ${{ github.event_name == 'pull_request' && 'DEV-Terraform' || (inputs.target_environment == 'test' && 'TEST-Terraform' || 'DEV-Terraform') }}
 

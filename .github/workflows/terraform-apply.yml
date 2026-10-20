@@ -1,16 +1,11 @@
 name: Terraform Apply
 
-# Terraform runs FIRST, DCM runs SECOND, always, one after another -- per client
-# direction. dcm-deploy.yml now triggers via `workflow_run` on THIS workflow's completion,
-# gated on success (`if: github.event.workflow_run.conclusion == 'success'`), guaranteeing
-# DCM never deploys without a confirmed-successful Terraform apply immediately before it.
-# This replaces the earlier "Verify DCM identity is ready" fail-fast check in dcm-deploy.yml
-# -- that was a workaround for the lack of a real ordering guarantee; now there is one.
+# Terraform runs FIRST, DCM runs SECOND -- per client direction. dcm-deploy.yml is
+# triggered via workflow_run only after this workflow completes successfully.
 #
-# Path filter includes dcm/** as well as terraform/** so a DCM-only push also runs
-# Terraform Apply first, giving dcm-deploy.yml something to chain from. Unlike the plan
-# side, this needs no Checks API workaround -- by the time a push to main happens, the PR
-# is already merged and required checks already passed, so there's no PR left to gate.
+# The Terraform plan is generated before a required-reviewer approval gate. The exact
+# saved plan is then applied, so the reviewed resource changes cannot drift from what is
+# applied. DCM-only changes still run Terraform first to preserve the deployment ordering.
 
 on:
   push:
@@ -25,9 +20,13 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: terraform-dev-apply
+  cancel-in-progress: false
+
 jobs:
-  apply:
-    name: Terraform Apply
+  terraform-plan:
+    name: Terraform Plan (DEV)
     runs-on: ubuntu-latest
     environment:
       name: DEV-Terraform
@@ -68,5 +67,107 @@ jobs:
       - name: Terraform Init
         run: terraform init -backend-config="env/${{ env.TARGET_ENV }}/backend.hcl"
 
-      - name: Terraform Apply
-        run: terraform apply -var-file="env/${{ env.TARGET_ENV }}/${{ env.TARGET_ENV }}.tfvars" -auto-approve
+      - name: Terraform Plan
+        run: |
+          set -o pipefail
+          terraform plan \
+            -var-file="env/${{ env.TARGET_ENV }}/${{ env.TARGET_ENV }}.tfvars" \
+            -no-color \
+            -out=tfplan | tee plan_output.txt
+          {
+            echo "## Terraform Plan (DEV)"
+            echo '```text'
+            cat plan_output.txt
+            echo '```'
+            echo
+            echo "Approval prompt: OK to apply the planned resource changes above, including the named warehouses and their dependent resources?"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload saved Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: terraform/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  approve-terraform-apply:
+    name: "Approve Terraform Apply: OK to apply the planned resource changes?"
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    environment:
+      name: DEV-Terraform-Apply
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    permissions:
+      contents: read
+    steps:
+      - name: Record approval
+        run: echo "Terraform plan approved; applying the saved plan."
+
+  apply:
+    name: Terraform Apply (DEV)
+    needs: [terraform-plan, approve-terraform-apply]
+    runs-on: ubuntu-latest
+    environment:
+      name: DEV-Terraform
+
+    env:
+      TF_VAR_snowflake_organization_name: xygpmhm
+      TF_VAR_snowflake_account_name: gq04150
+      TARGET_ENV: dev
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::525218385225:role/snowflake-platform-tf-github-oidc
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+
+      - name: Fetch Snowflake OIDC token
+        run: |
+          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=snowflakecomputing.com" | jq -r '.value')
+          echo "::add-mask::$TOKEN"
+          echo "SNOWFLAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="env/${{ env.TARGET_ENV }}/backend.hcl"
+
+      - name: Download reviewed Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: terraform
+
+      - name: Verify reviewed commit is still the main branch tip
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: main } = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'heads/main',
+            });
+            if (main.object.sha !== context.sha) {
+              core.setFailed(
+                'The reviewed Terraform plan is no longer for the main branch tip. ' +
+                'Review the latest run before applying.'
+              );
+            }
+
+      - name: Apply reviewed Terraform plan
+        run: terraform apply -no-color tfplan
